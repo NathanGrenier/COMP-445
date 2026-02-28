@@ -2,4 +2,4 @@
 Collection of Assignments and Labs for Concordia's Computer Networks (COMP-445) Course 
 
 ## Lab 2
-View the [Lab 2 README here](https://github.com/NathanGrenier/SOEN-471/blob/main/lab2/README.md)   .
+View the [Lab 2 README Here](https://github.com/NathanGrenier/COMP-445/tree/main/lab2).
