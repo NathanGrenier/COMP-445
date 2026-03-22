@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import socket
 import struct
@@ -20,13 +21,16 @@ log = setup_logger("SERVER", COLOR_GREEN)
 # H = Payload Length (2 bytes, uint16)
 HEADER_FORMAT = "!IIBH"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
-DATA_DIR = "data"
 MAX_UDP_PAYLOAD = 65507
 
 # --- Protocol Settings ---
 ACK_TIMEOUT_SEC = 1.0
 TIME_WAIT_RECV_TIMEOUT_SEC = 1.0
 TIME_WAIT_DURATION_SEC = 4.0
+
+# --- Directories ---
+DATA_DIR = "data"
+METRICS_DIR = "metrics"
 
 
 class MsgType(Enum):
@@ -62,6 +66,22 @@ class RDTServer:
         self.last_packet = b""
         self.time_wait_start = 0
 
+        self._reset_metrics()
+
+    def _reset_metrics(self):
+        self.stats = {
+            "retransmissions": 0,
+            "duplicate_acks": 0,
+            "stray_packets": 0,
+            "bytes_sent": 0,
+        }
+
+    def _save_metrics(self):
+        os.makedirs(METRICS_DIR, exist_ok=True)
+        metrics_path = os.path.join(METRICS_DIR, "server_metrics.json")
+        with open(metrics_path, "w") as f:
+            json.dump(self.stats, f, indent=4)
+
     def pack_message(
         self, conn_id: int, seq_num: int, msg_type: MsgType, payload: bytes = b""
     ) -> bytes:
@@ -95,6 +115,7 @@ class RDTServer:
         except KeyboardInterrupt:
             log.info("Server shutting down.")
         finally:
+            self._save_metrics()
             if self.file_obj and not self.file_obj.closed:
                 self.file_obj.close()
             self.sock.close()
@@ -109,6 +130,7 @@ class RDTServer:
             conn_id, seq_num, msg_type, payload = self.unpack_message(packet)
 
             if msg_type == MsgType.REQUEST:
+                self._reset_metrics()
                 raw_request = payload.decode("utf-8")
 
                 # Dynamic segment size negotiation
@@ -152,6 +174,8 @@ class RDTServer:
             self.conn_id, self.seq_num, MsgType.DATA, self.current_chunk
         )
         self.sock.sendto(self.last_packet, self.client_addr)
+        self.stats["bytes_sent"] += len(self.current_chunk)
+
         log.info(f"Sent DATA {self.seq_num} ({len(self.current_chunk)} bytes)")
         self.state = ServerState.WAIT_ACK
 
@@ -176,19 +200,24 @@ class RDTServer:
                         log.info("Final packet acknowledged. Entering TIME_WAIT.")
                         self.file_obj.close()
                         self.time_wait_start = time.time()
+                        self._save_metrics()  # Save upon successful completion
                         self.state = ServerState.TIME_WAIT
                     else:
                         # Move to the next sequence and read the next chunk
                         self.seq_num += 1
                         self.current_chunk = self.file_obj.read(self.segment_size)
                         self.state = ServerState.SEND_DATA
+                else:
+                    self.stats["duplicate_acks"] += 1
 
             elif msg_type == MsgType.REQUEST:
                 # The client's timeout triggered because it missed our first DATA packet
+                self.stats["retransmissions"] += 1
                 log.warning("Received duplicate REQUEST. Retransmitting first DATA packet.")
                 self.sock.sendto(self.last_packet, self.client_addr)
 
         except socket.timeout:
+            self.stats["retransmissions"] += 1
             log.warning(f"Timeout: No ACK received for DATA {self.seq_num}. Retransmitting...")
             self.sock.sendto(self.last_packet, self.client_addr)
         except (ValueError, struct.error):
@@ -210,6 +239,7 @@ class RDTServer:
             if conn_id == self.conn_id:
                 # Re-send the final DATA packet if a duplicate ACK or REQUEST arrives
                 if msg_type in (MsgType.ACK, MsgType.REQUEST):
+                    self.stats["stray_packets"] += 1
                     log.warning(
                         "Stray packet received during TIME_WAIT. Retransmitting final DATA."
                     )

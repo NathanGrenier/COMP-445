@@ -1,3 +1,4 @@
-downloaded_*.*
-out/**
 __pycache__/**
+
+out/**
+metrics/**

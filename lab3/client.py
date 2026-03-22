@@ -1,8 +1,10 @@
 import argparse
+import json
 import os
 import random
 import socket
 import struct
+import time
 from enum import Enum, auto
 
 # --- Logger ---
@@ -20,10 +22,13 @@ log = setup_logger("CLIENT", COLOR_CYAN)
 # H = Payload Length (2 bytes, uint16)
 HEADER_FORMAT = "!IIBH"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
-OUTPUT_DIR = "out"
 
 # --- Protocol Settings ---
 PACKET_TIMEOUT_SEC = 2.0
+
+# --- Directories ---
+OUTPUT_DIR = "out"
+METRICS_DIR = "metrics"
 
 
 class MsgType(Enum):
@@ -60,6 +65,18 @@ class RDTClient:
         self.state = ClientState.INIT
         self.output_file = None
 
+        # Analytics Metrics
+        self.stats = {
+            "conn_id": self.conn_id,
+            "status": "in_progress",
+            "start_time": 0.0,
+            "end_time": 0.0,
+            "bytes_received": 0,
+            "timeouts": 0,
+            "duplicate_data": 0,
+            "out_of_order": 0,
+        }
+
     def pack_message(self, msg_type: MsgType, seq_num: int, payload: bytes = b"") -> bytes:
         """Helper to create a binary packet according to the protocol spec."""
         header = struct.pack(HEADER_FORMAT, self.conn_id, seq_num, msg_type.value, len(payload))
@@ -87,6 +104,15 @@ class RDTClient:
                 elif self.state == ClientState.WAIT_FOR_DATA:
                     self._state_wait_for_data()
         finally:
+            if self.stats["end_time"] == 0.0:
+                self.stats["end_time"] = time.time()
+                self.stats["status"] = self.state.name
+
+            # Export Metrics
+            metrics_path = os.path.join(METRICS_DIR, "client_metrics.json")
+            with open(metrics_path, "w") as f:
+                json.dump(self.stats, f, indent=4)
+
             if self.output_file and not self.output_file.closed:
                 self.output_file.close()
             self.sock.close()
@@ -107,6 +133,9 @@ class RDTClient:
 
     def _state_send_request(self):
         """Send the REQUEST Packet."""
+        if self.stats["start_time"] == 0.0:
+            self.stats["start_time"] = time.time()
+
         # Embed the segment size into the payload: e.g., "512|test.txt"
         request_payload = f"{self.segment_size}|{self.filename}"
         packet = self.pack_message(MsgType.REQUEST, 0, request_payload.encode("utf-8"))
@@ -122,6 +151,8 @@ class RDTClient:
             packet, addr = self.sock.recvfrom(HEADER_SIZE + self.segment_size)
         except socket.timeout:
             # Timeout triggered. Retransmit last message.
+            self.stats["timeouts"] += 1
+
             if self.expected_seq == 0:
                 log.warning("Timeout waiting for first data packet. Retransmitting REQUEST...")
                 self.state = ClientState.SEND_REQUEST
@@ -152,6 +183,7 @@ class RDTClient:
             if seq_num == self.expected_seq:
                 # Write the payload data to the output file
                 self.output_file.write(payload)
+                self.stats["bytes_received"] += len(payload)
                 log.info(f"Received DATA {seq_num} ({len(payload)} bytes). Sending ACK.")
 
                 # Handle confirmations (Send ACK)
@@ -168,10 +200,12 @@ class RDTClient:
 
             elif seq_num < self.expected_seq:
                 # Received an older packet (ACK was likely lost). Re-ACK it.
+                self.stats["duplicate_data"] += 1
                 log.warning(f"Received duplicate DATA {seq_num}. Resending ACK.")
                 ack_pkt = self.pack_message(MsgType.ACK, seq_num)
                 self.sock.sendto(ack_pkt, self.server_addr)
             else:
+                self.stats["out_of_order"] += 1
                 log.warning(
                     f"Out of order packet {seq_num} (expected {self.expected_seq}). Ignored."
                 )
