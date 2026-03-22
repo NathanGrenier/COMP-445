@@ -5,6 +5,12 @@ import struct
 import time
 from enum import Enum, auto
 
+# --- Logger ---
+from logger import setup_logger
+
+COLOR_GREEN = "\033[92m"
+log = setup_logger("SERVER", COLOR_GREEN)
+
 # --- Packet Definitions ---
 # Header format: ! I I B H
 # ! = Network byte order (Big-Endian)
@@ -14,8 +20,13 @@ from enum import Enum, auto
 # H = Payload Length (2 bytes, uint16)
 HEADER_FORMAT = "!IIBH"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
-
 DATA_DIR = "data"
+MAX_UDP_PAYLOAD = 65507
+
+# --- Protocol Settings ---
+ACK_TIMEOUT_SEC = 1.0
+TIME_WAIT_RECV_TIMEOUT_SEC = 1.0
+TIME_WAIT_DURATION_SEC = 4.0
 
 
 class MsgType(Enum):
@@ -61,7 +72,7 @@ class RDTServer:
     def unpack_message(self, packet: bytes):
         """Helper to parse an incoming binary packet."""
         if len(packet) < HEADER_SIZE:
-            raise ValueError("[Error] Packet too small")
+            raise ValueError("Packet too small")
 
         header = packet[:HEADER_SIZE]
         conn_id, seq_num, msg_type_val, payload_len = struct.unpack(HEADER_FORMAT, header)
@@ -70,7 +81,7 @@ class RDTServer:
 
     def run(self):
         """Main state machine loop."""
-        print(f"Server listening on port {self.port} (Segment Size: {self.segment_size} bytes)")
+        log.info(f"Listening on port {self.port} (Segment Size: {self.segment_size} bytes)")
         try:
             while True:
                 if self.state == ServerState.LISTEN:
@@ -82,7 +93,7 @@ class RDTServer:
                 elif self.state == ServerState.TIME_WAIT:
                     self._state_time_wait()
         except KeyboardInterrupt:
-            print("\nServer shutting down.")
+            log.info("Server shutting down.")
         finally:
             if self.file_obj and not self.file_obj.closed:
                 self.file_obj.close()
@@ -93,8 +104,8 @@ class RDTServer:
         """Listen and Handle REQUEST Packets."""
         self.sock.settimeout(None)  # Block indefinitely while waiting for a client
         try:
-            # Use 65535 (Max UDP size) here because we haven't negotiated the segment size yet
-            packet, addr = self.sock.recvfrom(65535)
+            # Use MAX_UDP_PAYLOAD here because we haven't negotiated the segment size yet
+            packet, addr = self.sock.recvfrom(MAX_UDP_PAYLOAD)
             conn_id, seq_num, msg_type, payload = self.unpack_message(packet)
 
             if msg_type == MsgType.REQUEST:
@@ -104,14 +115,14 @@ class RDTServer:
                 if "|" in raw_request:
                     seg_str, filename = raw_request.split("|", 1)
                     self.segment_size = int(seg_str)
-                    print(f"[INFO] Client negotiated segment size: {self.segment_size} bytes")
+                    log.info(f"Client negotiated segment size: {self.segment_size} bytes")
                 else:
                     filename = raw_request
-                    print(
-                        f"[INFO] Standard client detected. Using default segment size: {self.segment_size} bytes"
+                    log.info(
+                        f"Standard client detected. Using default segment size: {self.segment_size} bytes"
                     )
 
-                print(f"[INFO] Received REQUEST for '{filename}' from {addr}")
+                log.info(f"Received REQUEST for '{filename}' from {addr}")
 
                 # Prevent directory traversal by only taking the base filename
                 safe_filename = os.path.basename(filename)
@@ -128,12 +139,12 @@ class RDTServer:
                     self.current_chunk = self.file_obj.read(self.segment_size)
                     self.state = ServerState.SEND_DATA
                 else:
-                    print(f"[Error] File '{filepath}' not found. Sending ERROR packet.")
+                    log.error(f"File '{filepath}' not found. Sending ERROR packet.")
                     err_pkt = self.pack_message(conn_id, 0, MsgType.ERROR, b"File not found")
                     self.sock.sendto(err_pkt, addr)
 
         except (ValueError, struct.error) as e:
-            print(f"[WARNING] Malformed packet received in LISTEN: {e}")
+            log.warning(f"Malformed packet received in LISTEN: {e}")
 
     def _state_send_data(self):
         """Send Data Using Stop-and-Wait."""
@@ -141,12 +152,14 @@ class RDTServer:
             self.conn_id, self.seq_num, MsgType.DATA, self.current_chunk
         )
         self.sock.sendto(self.last_packet, self.client_addr)
-        print(f"[INFO] Sent DATA {self.seq_num} ({len(self.current_chunk)} bytes)")
+        log.info(f"Sent DATA {self.seq_num} ({len(self.current_chunk)} bytes)")
         self.state = ServerState.WAIT_ACK
 
     def _state_wait_ack(self):
         """Handle timeouts, confirmations, and retransmissions."""
-        self.sock.settimeout(2.0)  # 2 second timeout
+        self.sock.settimeout(
+            ACK_TIMEOUT_SEC
+        )  # No congestion control, so we use a fixed timeout for ACKs
         try:
             packet, addr = self.sock.recvfrom(HEADER_SIZE + self.segment_size)
             conn_id, seq_num, msg_type, payload = self.unpack_message(packet)
@@ -157,10 +170,10 @@ class RDTServer:
 
             if msg_type == MsgType.ACK:
                 if seq_num == self.seq_num:
-                    print(f"[INFO] Received ACK {seq_num}")
+                    log.info(f"Received ACK {seq_num}")
                     # Check if this was the final packet
                     if len(self.current_chunk) < self.segment_size:
-                        print("[INFO] Final packet acknowledged. Entering TIME_WAIT.")
+                        log.info("Final packet acknowledged. Entering TIME_WAIT.")
                         self.file_obj.close()
                         self.time_wait_start = time.time()
                         self.state = ServerState.TIME_WAIT
@@ -172,21 +185,21 @@ class RDTServer:
 
             elif msg_type == MsgType.REQUEST:
                 # The client's timeout triggered because it missed our first DATA packet
-                print("[WARNING] Received duplicate REQUEST. Retransmitting first DATA packet.")
+                log.warning("Received duplicate REQUEST. Retransmitting first DATA packet.")
                 self.sock.sendto(self.last_packet, self.client_addr)
 
         except socket.timeout:
-            print(f"[Timeout] No ACK received for DATA {self.seq_num}. Retransmitting...")
+            log.warning(f"Timeout: No ACK received for DATA {self.seq_num}. Retransmitting...")
             self.sock.sendto(self.last_packet, self.client_addr)
         except (ValueError, struct.error):
-            print("[WARNING] Malformed packet received in WAIT_ACK. Ignored.")
+            log.warning("Malformed packet received in WAIT_ACK. Ignored.")
 
     def _state_time_wait(self):
         """Handle End of Connection."""
-        # Keep transfer state for a short time (5 seconds)
-        self.sock.settimeout(1.0)
-        if time.time() - self.time_wait_start > 5.0:
-            print("[INFO] Connection state discarded. Returning to LISTEN.\n")
+        # Keep transfer state for a short time to handle any straggling packets (e.g., duplicate ACKs or REQUESTs)
+        self.sock.settimeout(TIME_WAIT_RECV_TIMEOUT_SEC)
+        if time.time() - self.time_wait_start > TIME_WAIT_DURATION_SEC:
+            log.info("Connection state discarded. Returning to LISTEN.")
             self.state = ServerState.LISTEN
             return
 
@@ -197,36 +210,26 @@ class RDTServer:
             if conn_id == self.conn_id:
                 # Re-send the final DATA packet if a duplicate ACK or REQUEST arrives
                 if msg_type in (MsgType.ACK, MsgType.REQUEST):
-                    print(
-                        "[WARNING] Stray packet received during TIME_WAIT. Retransmitting final DATA."
+                    log.warning(
+                        "Stray packet received during TIME_WAIT. Retransmitting final DATA."
                     )
                     self.sock.sendto(self.last_packet, self.client_addr)
-
             elif msg_type == MsgType.REQUEST:
                 # Edge case: A completely new client request came in while we were waiting
                 # For this simple lab, we just drop the TIME_WAIT state and serve the new client.
-                print(
-                    "[INFO] New connection request received during TIME_WAIT. Resetting to LISTEN."
-                )
+                log.info("New connection request received during TIME_WAIT. Resetting to LISTEN.")
                 self.state = ServerState.LISTEN
 
         except socket.timeout:
             pass  # Loop again until 5 seconds passes
         except (ValueError, struct.error):
-            print("[WARNING] Malformed packet received in TIME_WAIT. Ignored.")
-            pass
+            log.warning("Malformed packet received in TIME_WAIT. Ignored.")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Reliable UDP File Transfer Server")
     parser.add_argument("port", type=int, help="UDP port to listen on")
-    parser.add_argument(
-        "--segment-size",
-        type=int,
-        default=512,
-        help="Maximum UDP payload size in bytes (default: 512)",
-    )
-
+    parser.add_argument("--segment-size", type=int, default=512, help="Maximum UDP payload size")
     args = parser.parse_args()
 
     server = RDTServer(port=args.port, segment_size=args.segment_size)

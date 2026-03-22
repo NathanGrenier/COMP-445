@@ -4,6 +4,7 @@
 1. `cd lab3/`
 2. Install the [uv python package manager](https://docs.astral.sh/uv/getting-started/installation) for your system.
 3. `uv sync`
+4. `source .venv/bin/activate`
 
 ## Protocol State Machines
 
@@ -66,3 +67,31 @@ uv run client.py 127.0.0.1 8080 test.txt --segment-size 512
 > Note: The file you specify must exist in the `data/` directory.
 
 ### Part 2
+
+Use the following command to:
+1. Start the `client.py` and `server.py` processes.
+2. Run the test scenarios.
+3. Collect and export the transmissions results.
+```sh
+sudo -E .venv/bin/python main.py test.txt
+```
+
+#### Network Emulation Architecture
+To simulate real-world network conditions on a single machine, the test orchestrator utilizes the following Linux networking features:
+1. **Namespaces (`ip netns`)**: Creates isolated network environments (`server_ns` and `client_ns`) to enforce traffic separation.
+2. **Virtual Ethernet (`veth`)**: Lays a virtual cable (`veth_s` to `veth_c`) linking the two isolated namespaces.
+3. **IP Configuration (`ip addr`)**: Assigns local IP addresses (`10.0.0.1` for the client, `10.0.0.2` for the server) and brings the interfaces online.
+4. **Traffic Control (`tc netem`)**: Injects artificial delay or packet loss into the server's outgoing interface to simulate a degraded network path.
+
+#### Test Scenarios
+Both scenarios automate the transfer of a user specified file over UDP port `8080`. The application layer protocol negotiates a segment payload size of `512 bytes`. The client and server run entirely isolated within their respective network namespaces, forcing all traffic through the emulator.
+
+##### Delay Scenario
+This scenario evaluates how the Reliable Data Transfer (RDT) protocol's timing and acknowledgement mechanics handle varied network latency.
+- **Traffic Control Rule:** `tc qdisc add dev veth_s root netem delay 50ms 10ms distribution normal`
+- **Network Conditions:** 50ms baseline delay with ±10ms of jitter, applied using a standard normal (bell-curve) distribution.
+
+##### Packet Loss Scenario
+This scenario tests the robustness of the protocol's timeout triggers and Stop-and-Wait retransmission logic under unreliable network conditions.
+- **Traffic Control Rule:** `tc qdisc add dev veth_s root netem loss 10%`
+- **Network Conditions:** A flat 10% packet drop rate applied to all outgoing packets from the server.

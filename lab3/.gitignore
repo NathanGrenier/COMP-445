@@ -1,2 +1,3 @@
 downloaded_*.*
 out/**
+__pycache__/**
